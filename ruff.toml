@@ -1,0 +1,7 @@
+# Ruff configuration
+select = ["F", "E", "W"]
+ignore = []
+
+[lint]
+# Enable Pyflakes (F) and pycodestyle (E, W)
+select = ["F", "E", "W"]

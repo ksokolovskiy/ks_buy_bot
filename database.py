@@ -239,14 +239,55 @@ class Database:
         except sqlite3.IntegrityError:
             return False
 
-    def delete_category(self, user_id: int, name: str) -> bool:
-        """Delete a category."""
+    def delete_category(self, user_id: int, name: str) -> tuple[bool, int]:
+        """Delete a category and all its items.
+        
+        Returns:
+            Tuple of (success: bool, items_deleted: int)
+        """
         with self._get_connection() as conn:
+            # First, delete all items in this category
+            cursor = conn.execute(
+                "DELETE FROM items WHERE user_id = ? AND department = ?",
+                (user_id, name)
+            )
+            items_deleted = cursor.rowcount
+            
+            # Then delete the category
             cursor = conn.execute(
                 "DELETE FROM categories WHERE user_id = ? AND name = ?",
                 (user_id, name)
             )
-            return cursor.rowcount > 0
+            return (cursor.rowcount > 0, items_deleted)
+    
+    def rename_category(self, user_id: int, old_name: str, new_name: str) -> bool:
+        """Rename a category and update all items in that category.
+        
+        Args:
+            user_id: User ID
+            old_name: Current category name
+            new_name: New category name
+            
+        Returns:
+            True if successful, False if new name already exists
+        """
+        try:
+            with self._get_connection() as conn:
+                # Update category name
+                conn.execute(
+                    "UPDATE categories SET name = ? WHERE user_id = ? AND name = ?",
+                    (new_name, user_id, old_name)
+                )
+                
+                # Update all items in this category
+                conn.execute(
+                    "UPDATE items SET department = ? WHERE user_id = ? AND department = ?",
+                    (new_name, user_id, old_name)
+                )
+                return True
+        except sqlite3.IntegrityError:
+            # New name already exists
+            return False
     
     def get_items(self, user_id: int, include_bought: bool = False) -> List[Dict]:
         """Get all items for a user."""

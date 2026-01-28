@@ -14,6 +14,8 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
+import functools
+import config
 import config
 from database import Database
 
@@ -30,20 +32,22 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 
 # Conversation states
 CHOOSING_DEPARTMENT, ENTERING_NAME = range(2)
+CAT_MANAGE_ACTION, CAT_ADDING, CAT_RENAMING_SELECT, CAT_RENAMING_NEW_NAME, CAT_DELETING_SELECT, CAT_DELETING_CONFIRM = range(2, 8)
 
 # Initialize database
 db = Database(config.DATABASE_URL)
 
-
-async def check_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if user is allowed to use the bot."""
-    user_id = update.effective_user.id
-    logger.info(f"Checking access for user {user_id}. Allowed: {config.ALLOWED_USERS}")
-    if user_id not in config.ALLOWED_USERS:
-        logger.warning(f"Unauthorized access attempt by user {user_id}")
-        await update.effective_message.reply_text(config.MSG_ACCESS_DENIED)
-        return False
-    return True
+def restricted(func):
+    """Decorator to check if user is allowed to use the bot."""
+    @functools.wraps(func)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id
+        if user_id not in config.ALLOWED_USERS:
+            logger.warning(f"Unauthorized access attempt by user {user_id}")
+            await update.effective_message.reply_text(config.MSG_ACCESS_DENIED)
+            return ConversationHandler.END if isinstance(func, type(add_item_start)) else None
+        return await func(update, context, *args, **kwargs)
+    return wrapped
 
 
 async def global_trace(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -62,16 +66,18 @@ def get_main_keyboard(context: ContextTypes.DEFAULT_TYPE = None):
             KeyboardButton(config.BUTTON_ADD_ITEM),
             KeyboardButton(config.BUTTON_SHOW_LIST),
             KeyboardButton(config.BUTTON_TOGGLE_BOUGHT)
+        ],
+        [
+            KeyboardButton(config.BUTTON_MANAGE_CATS)
         ]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
 
 
+@restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler."""
     logger.info(f"Start command from {update.effective_user.id}")
-    if not await check_access(update, context):
-        return
     
     # Seed data for the user on first start
     db.seed_data(update.effective_user.id)
@@ -84,11 +90,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["keyboard_msg_id"] = msg.message_id
 
 
+@restricted
 async def add_item_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the add item flow."""
     logger.info(f"Add item started by {update.effective_user.id}")
-    if not await check_access(update, context):
-        return ConversationHandler.END
     
     categories = db.get_categories(update.effective_user.id)
     if not categories:
@@ -142,22 +147,29 @@ async def item_name_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.add_item(user_id, item_name, department)
         await update.message.reply_text(config.MSG_ITEM_ADDED)
     
-    context.user_data.clear()
+    # Targeted cleanup
+    for key in ["department"]:
+        context.user_data.pop(key, None)
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel the current operation."""
-    context.user_data.clear()
-    await update.message.reply_text("Отменено.")
+    # Targeted cleanup
+    for key in ["department", "delete_cat_name", "rename_old_name"]:
+        context.user_data.pop(key, None)
+    
+    msg = "Отменено."
+    if update.message:
+        await update.message.reply_text(msg)
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(msg)
+    
     return ConversationHandler.END
 
 
 async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE, category=None, force_new=False):
     """List shopping items. If category is None, show category selection."""
-    if not await check_access(update, context):
-        return
-    
     user_id = update.effective_user.id
     show_bought = context.user_data.get("show_bought", False)
     edit_mode = context.user_data.get("edit_mode", False)
@@ -249,6 +261,7 @@ async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE, categor
         keyboard.append([InlineKeyboardButton(cat, callback_data=f"list_{cat}")])
     
     keyboard.append([InlineKeyboardButton("📝 Показать всё", callback_data="list_ALL")])
+    keyboard.append([InlineKeyboardButton("⚙️ Управление категориями", callback_data="manage_cats_inline")])
     
     await send_or_edit(update, context, "🗏 *Выберите категорию:*", reply_markup=InlineKeyboardMarkup(keyboard), force_new=force_new)
 
@@ -303,16 +316,17 @@ async def send_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
         logger.error(f"Send/Edit error: {e}")
 
 
+@restricted
 async def show_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle click on 'Show list' - always forces a new message to stay at bottom."""
+    """Handler for the 'List' button."""
     logger.info(f"Show list requested by {update.effective_user.id}")
     await list_items(update, context, force_new=True)
 
 
+@restricted
 async def toggle_view_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Toggle showing/hiding bought items from the main keyboard."""
     logger.info(f"Toggle view requested by {update.effective_user.id}")
-    if not await check_access(update, context): return
     
     # Delete the user's message to keep chat clean
     try: await update.message.delete()
@@ -326,10 +340,9 @@ async def toggle_view_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     await list_items(update, context, category=last_cat, force_new=True)
 
 
+@restricted
 async def add_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command to add a new category."""
-    if not await check_access(update, context):
-        return
     
     if not context.args:
         await update.message.reply_text("Использование: /add_cat Название категории")
@@ -342,9 +355,168 @@ async def add_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Категория уже существует.")
 
 
+@restricted
+async def manage_categories_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start category management flow."""
+    if update.callback_query:
+        await update.callback_query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить категорию", callback_data="cat_add")],
+        [InlineKeyboardButton("✏️ Переименовать категорию", callback_data="cat_rename")],
+        [InlineKeyboardButton("🗑 Удалить категорию", callback_data="cat_delete")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="cancel")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    if update.message:
+        await update.message.reply_text(config.MSG_CATEGORY_MENU, reply_markup=reply_markup, parse_mode='Markdown')
+    else:
+        await update.callback_query.edit_message_text(config.MSG_CATEGORY_MENU, reply_markup=reply_markup, parse_mode='Markdown')
+    
+    return CAT_MANAGE_ACTION
+
+
+async def cat_action_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle action selection in category management."""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    
+    if query.data == "cat_add":
+        await query.edit_message_text("Введите название новой категории:")
+        return CAT_ADDING
+    
+    elif query.data == "cat_rename":
+        categories = db.get_categories(user_id)
+        keyboard = []
+        for cat in categories:
+            keyboard.append([InlineKeyboardButton(cat, callback_data=f"rename_{cat}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")])
+        
+        await query.edit_message_text(config.MSG_CHOOSE_CATEGORY_TO_RENAME, reply_markup=InlineKeyboardMarkup(keyboard))
+        return CAT_RENAMING_SELECT
+    
+    elif query.data == "cat_delete":
+        categories = db.get_categories(user_id)
+        keyboard = []
+        for cat in categories:
+            keyboard.append([InlineKeyboardButton(cat, callback_data=f"delete_{cat}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")])
+        
+        await query.edit_message_text(config.MSG_CHOOSE_CATEGORY_TO_DELETE, reply_markup=InlineKeyboardMarkup(keyboard))
+        return CAT_DELETING_SELECT
+    
+    elif query.data == "back_to_menu":
+        return await manage_categories_start(update, context)
+        
+    elif query.data == "cancel":
+        await query.edit_message_text("Управление категориями завершено.")
+        return ConversationHandler.END
+
+
+async def cat_adding_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle new category name entry."""
+    cat_name = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    if db.add_category(user_id, cat_name):
+        await update.message.reply_text(f"✅ Категория '{cat_name}' добавлена.")
+    else:
+        await update.message.reply_text(config.MSG_CATEGORY_EXISTS)
+    
+    return await manage_categories_start(update, context)
+
+
+async def cat_renaming_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle category selection for renaming."""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "back_to_menu":
+        return await manage_categories_start(update, context)
+    
+    old_name = query.data.replace("rename_", "")
+    context.user_data["old_cat_name"] = old_name
+    
+    await query.edit_message_text(f"Выбрана категория: *{old_name}*\n\n{config.MSG_ENTER_NEW_CATEGORY_NAME}", parse_mode='Markdown')
+    return CAT_RENAMING_NEW_NAME
+
+
+async def cat_renaming_new_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle entry of new category name."""
+    new_name = update.message.text.strip()
+    old_name = context.user_data.get("old_cat_name")
+    user_id = update.effective_user.id
+    
+    if db.rename_category(user_id, old_name, new_name):
+        await update.message.reply_text(config.MSG_CATEGORY_RENAMED)
+    else:
+        await update.message.reply_text(config.MSG_CATEGORY_EXISTS)
+    
+    return await manage_categories_start(update, context)
+
+
+async def cat_deleting_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle category selection for deletion."""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "back_to_menu":
+        return await manage_categories_start(update, context)
+    
+    cat_name = query.data.replace("delete_", "")
+    user_id = update.effective_user.id
+    
+    # Check how many items are in this category
+    items = db.get_items(user_id, include_bought=True)
+    cat_items_count = len([i for i in items if i['department'] == cat_name])
+    
+    context.user_data["delete_cat_name"] = cat_name
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Да, удалить", callback_data="confirm_delete")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="back_to_menu")]
+    ]
+    
+    await query.edit_message_text(
+        config.MSG_CONFIRM_DELETE_CATEGORY.format(cat_name, cat_items_count),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    return CAT_DELETING_CONFIRM
+
+
+async def cat_deleting_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Actually delete the category and items."""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "back_to_menu":
+        return await manage_categories_start(update, context)
+    
+    cat_name = context.user_data.get("delete_cat_name")
+    user_id = update.effective_user.id
+    
+    success, items_deleted = db.delete_category(user_id, cat_name)
+    if success:
+        await query.edit_message_text(config.MSG_CATEGORY_DELETED.format(items_deleted))
+    else:
+        await query.edit_message_text("❌ Ошибка при удалении категории.")
+    
+    return await manage_categories_start(update, context)
+
+
 async def test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Simple test handler that skips check_access."""
     await update.message.reply_text("Бот работает и видит ваши сообщения! ✅")
+
+@restricted
+async def test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Simple test handler that skips check_access."""
+    await update.message.reply_text("Бот работает и видит ваши сообщения! ✅")
+
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline button clicks."""
@@ -395,6 +567,16 @@ def main():
 
     application = Application.builder().token(config.BOT_TOKEN).build()
     
+    # Common navigation fallbacks to break out of any conversation
+    nav_fallbacks = [
+        MessageHandler(filters.Regex(f"^{config.BUTTON_SHOW_LIST}$"), show_list_handler),
+        MessageHandler(filters.Regex(f"^{config.BUTTON_TOGGLE_BOUGHT}$"), toggle_view_handler),
+        MessageHandler(filters.Regex(f"^{config.BUTTON_MANAGE_CATS}$"), manage_categories_start),
+        CommandHandler("start", start),
+        CommandHandler("cancel", cancel),
+        CallbackQueryHandler(cancel, pattern="^cancel$")
+    ]
+
     # Add Item logic
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(f"^{config.BUTTON_ADD_ITEM}$"), add_item_start)],
@@ -402,7 +584,26 @@ def main():
             CHOOSING_DEPARTMENT: [CallbackQueryHandler(department_chosen)],
             ENTERING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, item_name_entered)],
         },
-        fallbacks=[MessageHandler(filters.Regex(f"^{config.BUTTON_CANCEL}$"), cancel)],
+        fallbacks=nav_fallbacks,
+        allow_reentry=True
+    )
+    
+    cat_conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("manage_categories", manage_categories_start),
+            MessageHandler(filters.Text([config.BUTTON_MANAGE_CATS]), manage_categories_start),
+            CallbackQueryHandler(manage_categories_start, pattern="^manage_cats_inline$")
+        ],
+        states={
+            CAT_MANAGE_ACTION: [CallbackQueryHandler(cat_action_chosen)],
+            CAT_ADDING: [MessageHandler(filters.TEXT & ~filters.COMMAND, cat_adding_name)],
+            CAT_RENAMING_SELECT: [CallbackQueryHandler(cat_renaming_selected)],
+            CAT_RENAMING_NEW_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, cat_renaming_new_name)],
+            CAT_DELETING_SELECT: [CallbackQueryHandler(cat_deleting_selected)],
+            CAT_DELETING_CONFIRM: [CallbackQueryHandler(cat_deleting_confirmed)],
+        },
+        fallbacks=nav_fallbacks,
+        allow_reentry=True
     )
     
     application.add_handler(MessageHandler(filters.ALL, global_trace), group=-1) # Group -1 ensures it runs first
@@ -410,6 +611,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("add_cat", add_category))
     application.add_handler(conv_handler)
+    application.add_handler(cat_conv_handler)
     application.add_handler(MessageHandler(filters.Text([config.BUTTON_SHOW_LIST]), show_list_handler))
     application.add_handler(MessageHandler(filters.Text([config.BUTTON_TOGGLE_BOUGHT]), toggle_view_handler))
     application.add_handler(CallbackQueryHandler(callback_handler))
