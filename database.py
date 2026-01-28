@@ -199,6 +199,34 @@ class Database:
             )
             return [row["name"] for row in cursor.fetchall()]
 
+    def get_categories_with_items(self, user_id: int, include_bought: bool = False) -> List[str]:
+        """Get categories that have items (optionally filtering by bought status).
+        
+        Args:
+            user_id: User ID
+            include_bought: If True, include categories with bought items. 
+                          If False, only return categories with unbought items.
+        
+        Returns:
+            List of category names that have items matching the criteria.
+        """
+        with self._get_connection() as conn:
+            query = """
+                SELECT DISTINCT c.name 
+                FROM categories c
+                INNER JOIN items i ON c.name = i.department AND c.user_id = i.user_id
+                WHERE c.user_id = ?
+            """
+            params = [user_id]
+            
+            if not include_bought:
+                query += " AND i.is_bought = 0"
+            
+            query += " ORDER BY c.id"
+            
+            cursor = conn.execute(query, params)
+            return [row["name"] for row in cursor.fetchall()]
+
     def add_category(self, user_id: int, name: str) -> bool:
         """Add a new category."""
         try:

@@ -239,7 +239,8 @@ async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE, categor
         return
 
     # Category selection with navigation at TOP if many
-    categories = db.get_categories(user_id)
+    # Filter categories based on show_bought flag
+    categories = db.get_categories_with_items(user_id, include_bought=show_bought)
     keyboard = []
     if len(categories) > 6:
         keyboard.append([InlineKeyboardButton("📝 Показать всё", callback_data="list_ALL")])
