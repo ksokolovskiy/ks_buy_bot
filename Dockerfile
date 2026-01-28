@@ -15,4 +15,4 @@ COPY . .
 RUN mkdir -p /app/data
 
 # Run the bot
-CMD ["python", "bot.py"]
+CMD ["python", "-u", "bot.py"]

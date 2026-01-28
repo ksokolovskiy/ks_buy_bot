@@ -229,10 +229,22 @@ class Database:
             if not include_bought:
                 query += " AND is_bought = 0"
             
-            query += " ORDER BY department, created_at"
+            query += " ORDER BY name COLLATE NOCASE"
             
             cursor = conn.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
+    
+    def add_item(self, user_id: int, name: str, department: str) -> bool:
+        """Add a new item to the shopping list."""
+        try:
+            with self._get_connection() as conn:
+                conn.execute(
+                    "INSERT INTO items (user_id, name, department, is_bought) VALUES (?, ?, ?, 0)",
+                    (user_id, name, department)
+                )
+                return True
+        except Exception:
+            return False
     
     def toggle_bought(self, item_id: int, user_id: int) -> bool:
         """Toggle the bought status of an item."""

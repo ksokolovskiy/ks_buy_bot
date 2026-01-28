@@ -1,7 +1,9 @@
 """Main Telegram bot implementation."""
+from dotenv import load_dotenv
+load_dotenv() # Load environment variables FIRST
+
 import logging
 import os
-from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
@@ -12,9 +14,6 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-# Load environment variables FIRST
-load_dotenv()
-
 import config
 from database import Database
 
@@ -26,6 +25,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Disable httpx logging to reduce noise
+logging.getLogger('httpx').setLevel(logging.WARNING)
+
 # Conversation states
 CHOOSING_DEPARTMENT, ENTERING_NAME = range(2)
 
@@ -36,6 +38,7 @@ db = Database(config.DATABASE_URL)
 async def check_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Check if user is allowed to use the bot."""
     user_id = update.effective_user.id
+    logger.info(f"Checking access for user {user_id}. Allowed: {config.ALLOWED_USERS}")
     if user_id not in config.ALLOWED_USERS:
         logger.warning(f"Unauthorized access attempt by user {user_id}")
         await update.effective_message.reply_text(config.MSG_ACCESS_DENIED)
@@ -43,40 +46,47 @@ async def check_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     return True
 
 
+async def global_trace(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log every incoming update for debugging."""
+    if update.message:
+        logger.info(f"TRACE: Message from {update.effective_user.id}: {update.message.text}")
+    elif update.callback_query:
+        logger.info(f"TRACE: Callback from {update.effective_user.id}: {update.callback_query.data}")
+    else:
+        logger.info(f"TRACE: Unknown update type from {update.effective_user.id}")
+
 def get_main_keyboard(context: ContextTypes.DEFAULT_TYPE = None):
-    """Get the main menu keyboard with dynamic toggle label."""
-    show_bought = False
-    if context and context.user_data:
-        show_bought = context.user_data.get("show_bought", False)
-    
-    toggle_label = config.BUTTON_SHOW_BOUGHT if not show_bought else config.BUTTON_HIDE_BOUGHT
-    
+    """Get the main menu keyboard."""
     keyboard = [
         [
             KeyboardButton(config.BUTTON_ADD_ITEM),
             KeyboardButton(config.BUTTON_SHOW_LIST),
-            KeyboardButton(toggle_label)
+            KeyboardButton(config.BUTTON_TOGGLE_BOUGHT)
         ]
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler."""
+    logger.info(f"Start command from {update.effective_user.id}")
     if not await check_access(update, context):
         return
     
     # Seed data for the user on first start
     db.seed_data(update.effective_user.id)
     
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         config.MSG_WELCOME,
         reply_markup=get_main_keyboard(context)
     )
+    # CRITICAL: Save keyboard message ID to prevent deletion
+    context.user_data["keyboard_msg_id"] = msg.message_id
 
 
 async def add_item_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the add item flow."""
+    logger.info(f"Add item started by {update.effective_user.id}")
     if not await check_access(update, context):
         return ConversationHandler.END
     
@@ -130,10 +140,7 @@ async def item_name_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if item_name and department:
         db.add_item(user_id, item_name, department)
-        await update.message.reply_text(
-            config.MSG_ITEM_ADDED,
-            reply_markup=get_main_keyboard(context)
-        )
+        await update.message.reply_text(config.MSG_ITEM_ADDED)
     
     context.user_data.clear()
     return ConversationHandler.END
@@ -142,14 +149,11 @@ async def item_name_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel the current operation."""
     context.user_data.clear()
-    await update.message.reply_text(
-        "Отменено.",
-        reply_markup=get_main_keyboard(context)
-    )
+    await update.message.reply_text("Отменено.")
     return ConversationHandler.END
 
 
-async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE, category=None, refresh_keyboard=False):
+async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE, category=None, force_new=False):
     """List shopping items. If category is None, show category selection."""
     if not await check_access(update, context):
         return
@@ -164,8 +168,7 @@ async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE, categor
     if category == "ALL":
         items = db.get_items(user_id, include_bought=show_bought)
         if not items:
-            main_kb = get_main_keyboard(context) if refresh_keyboard else None
-            await send_or_edit(update, context, config.MSG_LIST_EMPTY, refresh_keyboard, main_kb=main_kb)
+            await send_or_edit(update, context, config.MSG_LIST_EMPTY, reply_markup=None, force_new=force_new)
             return
 
         grouped = {}
@@ -205,16 +208,14 @@ async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE, categor
             keyboard.append([mode_btn])
             keyboard.append([InlineKeyboardButton("⬅️ Назад к категориям", callback_data="list_cats")])
 
-        main_kb = get_main_keyboard(context) if refresh_keyboard else None
-        await send_or_edit(update, context, message_text, InlineKeyboardMarkup(keyboard), refresh_keyboard, main_kb=main_kb)
+        await send_or_edit(update, context, message_text, reply_markup=InlineKeyboardMarkup(keyboard), force_new=force_new)
         return
 
     if category:
         items = [i for i in db.get_items(user_id, include_bought=show_bought) if i["department"] == category]
         if not items:
-            main_kb = get_main_keyboard(context) if refresh_keyboard else None
             await send_or_edit(update, context, f"В категории *{category}* пусто.", 
-                              InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="list_cats")]]), refresh_keyboard, main_kb=main_kb)
+                              reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="list_cats")]]), force_new=force_new)
             return
 
         message_text = f"📂 *Категория:* {category}\n"
@@ -234,67 +235,67 @@ async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE, categor
         mode_btn = InlineKeyboardButton("✅ Готово", callback_data=f"toggle_edit_{category}") if edit_mode else InlineKeyboardButton("⚙️ Удаление", callback_data=f"toggle_edit_{category}")
         keyboard.append([mode_btn])
         keyboard.append([InlineKeyboardButton("⬅️ Назад к категориям", callback_data="list_cats")])
-        main_kb = get_main_keyboard(context) if refresh_keyboard else None
-        await send_or_edit(update, context, message_text, InlineKeyboardMarkup(keyboard), refresh_keyboard, main_kb=main_kb)
+        await send_or_edit(update, context, message_text, reply_markup=InlineKeyboardMarkup(keyboard), force_new=force_new)
         return
 
-    # Default: Show Categories (1 per row to avoid truncation)
+    # Category selection with navigation at TOP if many
     categories = db.get_categories(user_id)
     keyboard = []
+    if len(categories) > 6:
+        keyboard.append([InlineKeyboardButton("📝 Показать всё", callback_data="list_ALL")])
+    
     for cat in categories:
         keyboard.append([InlineKeyboardButton(cat, callback_data=f"list_{cat}")])
     
     keyboard.append([InlineKeyboardButton("📝 Показать всё", callback_data="list_ALL")])
-    main_kb = get_main_keyboard(context) if refresh_keyboard else None
-    await send_or_edit(update, context, "🗏 *Выберите категорию:*", InlineKeyboardMarkup(keyboard), refresh_keyboard, main_kb=main_kb)
+    
+    await send_or_edit(update, context, "🗏 *Выберите категорию:*", reply_markup=InlineKeyboardMarkup(keyboard), force_new=force_new)
 
 
 
 
-async def send_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None, force_new=False, main_kb=None):
-    """Helper to send a new message or edit the existing one, with tracking."""
+async def send_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None, force_new=False):
+    """Helper to send a new message or edit the existing one, with tracking.
+    
+    NOTE: ReplyKeyboardMarkup is ONLY sent once at /start and never touched again.
+    """
     try:
         last_msg_id = context.user_data.get("last_list_msg_id")
         
-        # If we have a callback query and not forcing new, try editing
-        if update.callback_query and not force_new and not main_kb:
+        # 1. Try to edit in-place if no force_new
+        if last_msg_id and not force_new:
             try:
-                msg = await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+                msg = await context.bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=last_msg_id,
+                    text=text,
+                    parse_mode="Markdown",
+                    reply_markup=reply_markup 
+                )
                 context.user_data["last_list_msg_id"] = msg.message_id
                 return
             except Exception:
-                pass # Fallback to new message
-        
-        # If we need a new message (either forced or couldn't edit or need to refresh main kb)
-        if last_msg_id:
-            try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=last_msg_id)
-            except Exception: pass
+                pass
 
-        # THE SEAMLESS KEYBOARD TRICK:
-        # If we need to update the bottom buttons (main_kb) AND show list buttons (reply_markup),
-        # we send the message with the bottom buttons FIRST, then immediately edit it to add list buttons.
-        # This makes the keyboard update stick without visible temporary messages or disappearing.
-        
-        if main_kb:
-            msg = await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=text,
-                parse_mode="Markdown",
-                reply_markup=main_kb
-            )
-            if reply_markup:
-                # Small delay ensures some clients process the ReplyKeyboard update stably
-                import asyncio
-                await asyncio.sleep(0.1)
-                await msg.edit_reply_markup(reply_markup=reply_markup)
-        else:
-            msg = await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=text,
-                parse_mode="Markdown",
-                reply_markup=reply_markup
-            )
+        # 2. Delete old list message if exists (but NEVER delete the keyboard message)
+        keyboard_msg_id = context.user_data.get("keyboard_msg_id")
+        logger.info(f"send_or_edit: last_msg_id={last_msg_id}, keyboard_msg_id={keyboard_msg_id}")
+        if last_msg_id and last_msg_id != keyboard_msg_id:
+            logger.info(f"Deleting old list message: {last_msg_id}")
+            try: 
+                await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=last_msg_id)
+            except Exception as e:
+                logger.error(f"Failed to delete message {last_msg_id}: {e}")
+        elif last_msg_id == keyboard_msg_id:
+            logger.info(f"Skipping deletion of keyboard message: {keyboard_msg_id}")
 
+        # 3. Send the new list message with inline buttons
+        msg = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=reply_markup
+        )
         context.user_data["last_list_msg_id"] = msg.message_id
             
     except Exception as e:
@@ -302,12 +303,14 @@ async def send_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
 
 
 async def show_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle click on 'Show list'."""
-    await list_items(update, context)
+    """Handle click on 'Show list' - always forces a new message to stay at bottom."""
+    logger.info(f"Show list requested by {update.effective_user.id}")
+    await list_items(update, context, force_new=True)
 
 
 async def toggle_view_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Toggle showing/hiding bought items from the main keyboard."""
+    logger.info(f"Toggle view requested by {update.effective_user.id}")
     if not await check_access(update, context): return
     
     # Delete the user's message to keep chat clean
@@ -317,9 +320,9 @@ async def toggle_view_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     current = context.user_data.get("show_bought", False)
     context.user_data["show_bought"] = not current
     
-    # Refresh the list view and update the keyboard at the same time
+    # Refresh the view
     last_cat = context.user_data.get("last_category")
-    await list_items(update, context, category=last_cat, refresh_keyboard=True)
+    await list_items(update, context, category=last_cat, force_new=True)
 
 
 async def add_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -337,6 +340,10 @@ async def add_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Категория уже существует.")
 
+
+async def test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Simple test handler that skips check_access."""
+    await update.message.reply_text("Бот работает и видит ваши сообщения! ✅")
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline button clicks."""
@@ -379,6 +386,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Run bot."""
+    logger.info(f"DEBUG: BOT_TOKEN is set: {bool(config.BOT_TOKEN)}")
+    logger.info(f"DEBUG: ALLOWED_USERS: {config.ALLOWED_USERS}")
     if not config.BOT_TOKEN:
         print("Error: BOT_TOKEN not found in .env")
         return
@@ -395,11 +404,13 @@ def main():
         fallbacks=[MessageHandler(filters.Regex(f"^{config.BUTTON_CANCEL}$"), cancel)],
     )
     
+    application.add_handler(MessageHandler(filters.ALL, global_trace), group=-1) # Group -1 ensures it runs first
+    application.add_handler(CommandHandler("test", test_handler))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("add_cat", add_category))
     application.add_handler(conv_handler)
-    application.add_handler(MessageHandler(filters.Regex(f"^{config.BUTTON_SHOW_LIST}$"), show_list_handler))
-    application.add_handler(MessageHandler(filters.Regex(f"^({config.BUTTON_SHOW_BOUGHT}|{config.BUTTON_HIDE_BOUGHT})$"), toggle_view_handler))
+    application.add_handler(MessageHandler(filters.Text([config.BUTTON_SHOW_LIST]), show_list_handler))
+    application.add_handler(MessageHandler(filters.Text([config.BUTTON_TOGGLE_BOUGHT]), toggle_view_handler))
     application.add_handler(CallbackQueryHandler(callback_handler))
     
     logger.info("Bot started...")

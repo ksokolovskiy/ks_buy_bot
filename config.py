@@ -13,8 +13,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "data/shopping_list.db")
 # Button labels
 BUTTON_ADD_ITEM = "➕ Добавить"
 BUTTON_SHOW_LIST = "📋 Список"
-BUTTON_SHOW_BOUGHT = "👁 Показать"
-BUTTON_HIDE_BOUGHT = "🛡 Скрыть"
+BUTTON_TOGGLE_BOUGHT = "👁 Показать/Скрыть"
 BUTTON_CANCEL = "❌ Отмена"
 
 # Messages
