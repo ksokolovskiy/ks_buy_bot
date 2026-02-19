@@ -68,7 +68,8 @@ def get_main_keyboard(context: ContextTypes.DEFAULT_TYPE = None):
             KeyboardButton(config.BUTTON_TOGGLE_BOUGHT)
         ],
         [
-            KeyboardButton(config.BUTTON_MANAGE_CATS)
+            KeyboardButton(config.BUTTON_MANAGE_CATS),
+            KeyboardButton(config.BUTTON_SHARE_LIST)
         ]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
@@ -341,6 +342,59 @@ async def toggle_view_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 @restricted
+async def share_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the 'Share' button."""
+    logger.info(f"Share requested by {update.effective_user.id}")
+    invite_code = db.get_invite_code(update.effective_user.id)
+    await update.message.reply_text(
+        config.MSG_SHARE_INFO.format(invite_code, invite_code),
+        parse_mode="Markdown"
+    )
+
+
+@restricted
+async def join_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /join command."""
+    if not context.args:
+        await update.message.reply_text("Использование: /join КОД")
+        return
+    
+    invite_code = context.args[0].upper()
+    context.user_data["pending_invite_code"] = invite_code
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Присоединиться", callback_data="join_confirm"),
+            InlineKeyboardButton("❌ Отмена", callback_data="join_cancel")
+        ]
+    ]
+    await update.message.reply_text(
+        config.MSG_JOIN_CONFIRM,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def join_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle join confirmation."""
+    query = update.callback_query
+    await query.answer()
+    
+    invite_code = context.user_data.get("pending_invite_code")
+    if not invite_code:
+        await query.edit_message_text("Ошибка: код не найден.")
+        return
+
+    success, message = db.join_group(update.effective_user.id, invite_code)
+    if success:
+        await query.edit_message_text(config.MSG_JOIN_SUCCESS)
+    else:
+        await query.edit_message_text(config.MSG_JOIN_ERROR)
+    
+    context.user_data.pop("pending_invite_code", None)
+
+
+@restricted
 async def add_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command to add a new category."""
     
@@ -553,8 +607,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item_id = int(parts[1])
         ref_cat = parts[2] if len(parts) > 2 else None
         db.delete_item(item_id, user_id)
-        # Stay in edit mode/current view
+        # Update current view
         await list_items(update, context, category=ref_cat if ref_cat != "all" else "ALL")
+    elif data == "join_confirm":
+        await join_confirm_handler(update, context)
+    elif data == "join_cancel":
+        context.user_data.pop("pending_invite_code", None)
+        await query.edit_message_text("Вход в группу отменен.")
 
 
 def main():
@@ -573,6 +632,8 @@ def main():
         MessageHandler(filters.Regex(f"^{config.BUTTON_TOGGLE_BOUGHT}$"), toggle_view_handler),
         MessageHandler(filters.Regex(f"^{config.BUTTON_MANAGE_CATS}$"), manage_categories_start),
         CommandHandler("start", start),
+        CommandHandler("share", share_handler),
+        CommandHandler("join", join_command_handler),
         CommandHandler("cancel", cancel),
         CallbackQueryHandler(cancel, pattern="^cancel$")
     ]
@@ -614,6 +675,9 @@ def main():
     application.add_handler(cat_conv_handler)
     application.add_handler(MessageHandler(filters.Text([config.BUTTON_SHOW_LIST]), show_list_handler))
     application.add_handler(MessageHandler(filters.Text([config.BUTTON_TOGGLE_BOUGHT]), toggle_view_handler))
+    application.add_handler(CommandHandler("join", join_command_handler))
+    application.add_handler(CommandHandler("share", share_handler))
+    application.add_handler(MessageHandler(filters.Text([config.BUTTON_SHARE_LIST]), share_handler))
     application.add_handler(CallbackQueryHandler(callback_handler))
     
     logger.info("Bot started...")

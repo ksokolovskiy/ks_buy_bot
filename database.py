@@ -1,7 +1,8 @@
 """Database module for managing shopping list items using SQLite."""
 import sqlite3
 import os
-from typing import List, Dict, Optional
+import uuid
+from typing import List, Dict, Optional, Tuple
 from contextlib import contextmanager
 
 
@@ -39,13 +40,32 @@ class Database:
     def _init_db(self):
         """Initialize database schema and seed initial data."""
         with self._get_connection() as conn:
+            # Groups table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS groups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    invite_code TEXT UNIQUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # User to Group mapping
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_groups (
+                    user_id INTEGER PRIMARY KEY,
+                    group_id INTEGER NOT NULL,
+                    FOREIGN KEY (group_id) REFERENCES groups(id)
+                )
+            """)
+
             # Categories table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS categories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
                     name TEXT NOT NULL,
-                    UNIQUE(user_id, name)
+                    group_id INTEGER,
+                    UNIQUE(group_id, name)
                 )
             """)
             
@@ -57,15 +77,117 @@ class Database:
                     name TEXT NOT NULL,
                     department TEXT NOT NULL,
                     is_bought INTEGER DEFAULT 0,
+                    group_id INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_user_id ON items(user_id)
-            """)
             
+            # Migrations
+            self._migrate(conn)
+
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_group_id ON items(group_id)
+            """)
+
+    def _migrate(self, conn):
+        """Migrate legacy data to group-based system."""
+        # 1. Add group_id column to categories if not exists
+        cursor = conn.execute("PRAGMA table_info(categories)")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if "group_id" not in columns:
+            conn.execute("ALTER TABLE categories ADD COLUMN group_id INTEGER")
+            # We also need to remove the UNIQUE(user_id, name) constraint and add UNIQUE(group_id, name)
+            # In SQLite this is hard, but for now we'll just live with both or ignore name conflicts if they happen.
+        
+        # 2. Add group_id column to items if not exists
+        cursor = conn.execute("PRAGMA table_info(items)")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if "group_id" not in columns:
+            conn.execute("ALTER TABLE items ADD COLUMN group_id INTEGER")
+
+        # 3. Create groups for existing users who don't have one
+        # Find all unique user_ids from all tables
+        cursor = conn.execute("""
+            SELECT user_id FROM items 
+            UNION SELECT user_id FROM categories 
+            UNION SELECT user_id FROM user_groups
+        """)
+        user_ids = [row["user_id"] for row in cursor.fetchall()]
+        
+        for user_id in user_ids:
+            # Check if user has a group
+            cursor = conn.execute("SELECT group_id FROM user_groups WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            if not row:
+                # Create a group for this user
+                import uuid
+                invite_code = str(uuid.uuid4())[:8].upper()
+                cursor = conn.execute("INSERT INTO groups (invite_code) VALUES (?)", (invite_code,))
+                group_id = cursor.lastrowid
+                conn.execute("INSERT INTO user_groups (user_id, group_id) VALUES (?, ?)", (user_id, group_id))
+            else:
+                group_id = row["group_id"]
+            
+            # Update their items and categories
+            conn.execute("UPDATE items SET group_id = ? WHERE user_id = ? AND group_id IS NULL", (group_id, user_id))
+            conn.execute("UPDATE categories SET group_id = ? WHERE user_id = ? AND group_id IS NULL", (group_id, user_id))
+            
+    def _get_user_group(self, user_id: int) -> int:
+        """Get the group_id for a user, creating a personal group if none exists."""
+        with self._get_connection() as conn:
+            cursor = conn.execute("SELECT group_id FROM user_groups WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            if row:
+                return row["group_id"]
+            
+            # Create a personal group if none exists
+            invite_code = str(uuid.uuid4())[:8].upper()
+            cursor = conn.execute("INSERT INTO groups (invite_code) VALUES (?)", (invite_code,))
+            group_id = cursor.lastrowid
+            conn.execute("INSERT INTO user_groups (user_id, group_id) VALUES (?, ?)", (user_id, group_id))
+            return group_id
+
+    def get_invite_code(self, user_id: int) -> str:
+        """Get the invite code for the user's current group."""
+        group_id = self._get_user_group(user_id)
+        with self._get_connection() as conn:
+            cursor = conn.execute("SELECT invite_code FROM groups WHERE id = ?", (group_id,))
+            row = cursor.fetchone()
+            return row["invite_code"] if row else ""
+
+    def join_group(self, user_id: int, invite_code: str) -> Tuple[bool, str]:
+        """Join a group by invite code.
+        
+        Returns:
+            Tuple of (success, message)
+        """
+        invite_code = invite_code.strip().upper()
+        with self._get_connection() as conn:
+            cursor = conn.execute("SELECT id FROM groups WHERE invite_code = ?", (invite_code,))
+            row = cursor.fetchone()
+            if not row:
+                return False, "Неверный код приглашения."
+            
+            new_group_id = row["id"]
+            
+            # Check if user is already in this group
+            cursor = conn.execute("SELECT group_id FROM user_groups WHERE user_id = ?", (user_id,))
+            current_row = cursor.fetchone()
+            if current_row and current_row["group_id"] == new_group_id:
+                return True, "Вы уже в этой группе."
+
+            # Update or insert user's group
+            if current_row:
+                conn.execute("UPDATE user_groups SET group_id = ? WHERE user_id = ?", (new_group_id, user_id))
+            else:
+                conn.execute("INSERT INTO user_groups (user_id, group_id) VALUES (?, ?)", (user_id, new_group_id))
+            
+            return True, "Вы успешно присоединились к группе!"
+
     def seed_data(self, user_id: int):
-        """Seed initial categories and items."""
+        """Seed initial categories and items for the user's group."""
+        group_id = self._get_user_group(user_id)
+        
         initial_categories = [
             "🧹 Быт и уборка",
             "🧴 Гигиена и уход",
@@ -85,16 +207,16 @@ class Database:
             # Add categories
             for cat in initial_categories:
                 conn.execute(
-                    "INSERT OR IGNORE INTO categories (user_id, name) VALUES (?, ?)",
-                    (user_id, cat)
+                    "INSERT OR IGNORE INTO categories (user_id, group_id, name) VALUES (?, ?, ?)",
+                    (user_id, group_id, cat)
                 )
             
-            # Check if items already exist for this user to avoid double seeding
-            cursor = conn.execute("SELECT COUNT(*) as count FROM items WHERE user_id = ?", (user_id,))
+            # Check if items already exist for this group to avoid double seeding
+            cursor = conn.execute("SELECT COUNT(*) as count FROM items WHERE group_id = ?", (group_id,))
             if cursor.fetchone()["count"] > 0:
                 return
 
-            # Pre-populate items with mapping to new categories
+            # Pre-populate items
             items_to_seed = [
                 # Быт и уборка
                 ("Пакеты для мусора", "🧹 Быт и уборка"), ("Жидкость для посудомойки", "🧹 Быт и уборка"),
@@ -186,38 +308,31 @@ class Database:
             
             for name, dept in items_to_seed:
                 conn.execute(
-                    "INSERT INTO items (user_id, name, department, is_bought) VALUES (?, ?, ?, 0)",
-                    (user_id, name, dept)
+                    "INSERT INTO items (user_id, group_id, name, department, is_bought) VALUES (?, ?, ?, ?, 0)",
+                    (user_id, group_id, name, dept)
                 )
 
     def get_categories(self, user_id: int) -> List[str]:
-        """Get all categories for a user."""
+        """Get all categories for a user's group."""
+        group_id = self._get_user_group(user_id)
         with self._get_connection() as conn:
             cursor = conn.execute(
-                "SELECT name FROM categories WHERE user_id = ? ORDER BY id",
-                (user_id,)
+                "SELECT name FROM categories WHERE group_id = ? ORDER BY id",
+                (group_id,)
             )
             return [row["name"] for row in cursor.fetchall()]
 
     def get_categories_with_items(self, user_id: int, include_bought: bool = False) -> List[str]:
-        """Get categories that have items (optionally filtering by bought status).
-        
-        Args:
-            user_id: User ID
-            include_bought: If True, include categories with bought items. 
-                          If False, only return categories with unbought items.
-        
-        Returns:
-            List of category names that have items matching the criteria.
-        """
+        """Get categories that have items in the user's group."""
+        group_id = self._get_user_group(user_id)
         with self._get_connection() as conn:
             query = """
                 SELECT DISTINCT c.name 
                 FROM categories c
-                INNER JOIN items i ON c.name = i.department AND c.user_id = i.user_id
-                WHERE c.user_id = ?
+                INNER JOIN items i ON c.name = i.department AND c.group_id = i.group_id
+                WHERE c.group_id = ?
             """
-            params = [user_id]
+            params = [group_id]
             
             if not include_bought:
                 query += " AND i.is_bought = 0"
@@ -228,72 +343,62 @@ class Database:
             return [row["name"] for row in cursor.fetchall()]
 
     def add_category(self, user_id: int, name: str) -> bool:
-        """Add a new category."""
+        """Add a new category to user's group."""
+        group_id = self._get_user_group(user_id)
         try:
             with self._get_connection() as conn:
                 conn.execute(
-                    "INSERT INTO categories (user_id, name) VALUES (?, ?)",
-                    (user_id, name)
+                    "INSERT INTO categories (user_id, group_id, name) VALUES (?, ?, ?)",
+                    (user_id, group_id, name)
                 )
                 return True
         except sqlite3.IntegrityError:
             return False
 
-    def delete_category(self, user_id: int, name: str) -> tuple[bool, int]:
-        """Delete a category and all its items.
-        
-        Returns:
-            Tuple of (success: bool, items_deleted: int)
-        """
+    def delete_category(self, user_id: int, name: str) -> Tuple[bool, int]:
+        """Delete a category and all its items from user's group."""
+        group_id = self._get_user_group(user_id)
         with self._get_connection() as conn:
             # First, delete all items in this category
             cursor = conn.execute(
-                "DELETE FROM items WHERE user_id = ? AND department = ?",
-                (user_id, name)
+                "DELETE FROM items WHERE group_id = ? AND department = ?",
+                (group_id, name)
             )
             items_deleted = cursor.rowcount
             
             # Then delete the category
             cursor = conn.execute(
-                "DELETE FROM categories WHERE user_id = ? AND name = ?",
-                (user_id, name)
+                "DELETE FROM categories WHERE group_id = ? AND name = ?",
+                (group_id, name)
             )
             return (cursor.rowcount > 0, items_deleted)
     
     def rename_category(self, user_id: int, old_name: str, new_name: str) -> bool:
-        """Rename a category and update all items in that category.
-        
-        Args:
-            user_id: User ID
-            old_name: Current category name
-            new_name: New category name
-            
-        Returns:
-            True if successful, False if new name already exists
-        """
+        """Rename a category in user's group."""
+        group_id = self._get_user_group(user_id)
         try:
             with self._get_connection() as conn:
                 # Update category name
                 conn.execute(
-                    "UPDATE categories SET name = ? WHERE user_id = ? AND name = ?",
-                    (new_name, user_id, old_name)
+                    "UPDATE categories SET name = ? WHERE group_id = ? AND name = ?",
+                    (new_name, group_id, old_name)
                 )
                 
                 # Update all items in this category
                 conn.execute(
-                    "UPDATE items SET department = ? WHERE user_id = ? AND department = ?",
-                    (new_name, user_id, old_name)
+                    "UPDATE items SET department = ? WHERE group_id = ? AND department = ?",
+                    (new_name, group_id, old_name)
                 )
                 return True
         except sqlite3.IntegrityError:
-            # New name already exists
             return False
     
     def get_items(self, user_id: int, include_bought: bool = False) -> List[Dict]:
-        """Get all items for a user."""
+        """Get all items for a user's group."""
+        group_id = self._get_user_group(user_id)
         with self._get_connection() as conn:
-            query = "SELECT * FROM items WHERE user_id = ?"
-            params = [user_id]
+            query = "SELECT * FROM items WHERE group_id = ?"
+            params = [group_id]
             
             if not include_bought:
                 query += " AND is_bought = 0"
@@ -304,23 +409,25 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
     
     def add_item(self, user_id: int, name: str, department: str) -> bool:
-        """Add a new item to the shopping list."""
+        """Add a new item to the user's group shopping list."""
+        group_id = self._get_user_group(user_id)
         try:
             with self._get_connection() as conn:
                 conn.execute(
-                    "INSERT INTO items (user_id, name, department, is_bought) VALUES (?, ?, ?, 0)",
-                    (user_id, name, department)
+                    "INSERT INTO items (user_id, group_id, name, department, is_bought) VALUES (?, ?, ?, ?, 0)",
+                    (user_id, group_id, name, department)
                 )
                 return True
         except Exception:
             return False
     
     def toggle_bought(self, item_id: int, user_id: int) -> bool:
-        """Toggle the bought status of an item."""
+        """Toggle the bought status of an item in user's group."""
+        group_id = self._get_user_group(user_id)
         with self._get_connection() as conn:
             cursor = conn.execute(
-                "SELECT is_bought FROM items WHERE id = ? AND user_id = ?",
-                (item_id, user_id)
+                "SELECT is_bought FROM items WHERE id = ? AND group_id = ?",
+                (item_id, group_id)
             )
             row = cursor.fetchone()
             if not row:
@@ -328,34 +435,37 @@ class Database:
             
             new_status = 0 if row["is_bought"] else 1
             conn.execute(
-                "UPDATE items SET is_bought = ? WHERE id = ? AND user_id = ?",
-                (new_status, item_id, user_id)
+                "UPDATE items SET is_bought = ? WHERE id = ? AND group_id = ?",
+                (new_status, item_id, group_id)
             )
             return bool(new_status)
     
     def delete_item(self, item_id: int, user_id: int) -> bool:
-        """Delete an item."""
+        """Delete an item from user's group."""
+        group_id = self._get_user_group(user_id)
         with self._get_connection() as conn:
             cursor = conn.execute(
-                "DELETE FROM items WHERE id = ? AND user_id = ?",
-                (item_id, user_id)
+                "DELETE FROM items WHERE id = ? AND group_id = ?",
+                (item_id, group_id)
             )
             return cursor.rowcount > 0
     
     def clear_bought_items(self, user_id: int) -> int:
-        """Delete all bought items for a user."""
+        """Delete all bought items for a user's group."""
+        group_id = self._get_user_group(user_id)
         with self._get_connection() as conn:
             cursor = conn.execute(
-                "DELETE FROM items WHERE user_id = ? AND is_bought = 1",
-                (user_id,)
+                "DELETE FROM items WHERE group_id = ? AND is_bought = 1",
+                (group_id,)
             )
             return cursor.rowcount
     
     def update_item_name(self, item_id: int, user_id: int, name: str) -> bool:
-        """Update an item's name."""
+        """Update an item's name in user's group."""
+        group_id = self._get_user_group(user_id)
         with self._get_connection() as conn:
             cursor = conn.execute(
-                "UPDATE items SET name = ? WHERE id = ? AND user_id = ?",
-                (name, item_id, user_id)
+                "UPDATE items SET name = ? WHERE id = ? AND group_id = ?",
+                (name, item_id, group_id)
             )
             return cursor.rowcount > 0
